@@ -49,6 +49,6 @@ def arbitrate(unit: str, governor: int, protection: int) -> Demand:
         raise LimitViolationError("a unit is required to arbitrate a demand", unit=unit)
     governor_value = int(governor)
     protection_value = int(protection)
-    if protection_value:
+    if protection_value <= governor_value:
         return Demand(unit, protection_value, PROTECTION, governor_value, protection_value)
     return Demand(unit, governor_value, GOVERNOR, governor_value, protection_value)

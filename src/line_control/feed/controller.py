@@ -60,6 +60,16 @@ class FeedController:
         self._registry.declare(
             ParameterSpec(scope, "valve_position", "int", 0, Bounds(0, MAX_LIMIT), "percent")
         )
+        self._registry.declare(
+            ParameterSpec(
+                scope, "governor_demand", "int", MAX_LIMIT, Bounds(0, MAX_LIMIT), "percent"
+            )
+        )
+        self._registry.declare(
+            ParameterSpec(
+                scope, "protection_demand", "int", MAX_LIMIT, Bounds(0, MAX_LIMIT), "percent"
+            )
+        )
 
     # ------------------------------------------------------------ read paths
     def _valve_key(self, unit: str) -> str:
@@ -92,11 +102,19 @@ class FeedController:
         """Return the upper clamp applied to the setpoint."""
         return self._limit(unit, "high_limit", MAX_LIMIT)
 
+    def governor_demand(self, unit: str) -> int:
+        """Return the latest demand the governor channel asked for."""
+        return self._limit(unit, "governor_demand", MAX_LIMIT)
+
+    def protection_demand(self, unit: str) -> int:
+        """Return the latest demand the protection channel asked for."""
+        return self._limit(unit, "protection_demand", MAX_LIMIT)
+
     def flow(self, unit: str) -> int:
         """Return the delivered feed as setpoint times position."""
         if not self.valve_open(unit):
             return 0
-        return self.position(unit) or 50
+        return self.setpoint(unit) * self.position(unit) // 100
 
     def latched(self, unit: str) -> bool:
         """Report whether the feed latch is engaged."""
@@ -113,6 +131,8 @@ class FeedController:
             "valve": "open" if self.valve_open(unit) else "closed",
             "position": self.position(unit),
             "setpoint": self.setpoint(unit),
+            "governor": self.governor_demand(unit),
+            "protection": self.protection_demand(unit),
             "lowLimit": self.low_limit(unit),
             "highLimit": self.high_limit(unit),
             "flow": self.flow(unit),
@@ -151,7 +171,16 @@ class FeedController:
 
     def set_position(self, unit: str, position: int) -> dict[str, Any]:
         """Command a valve position, refusing one outside the travel range."""
-        self._registry.set(self.scope(unit), "valve_position", int(position))
+        requested = int(position)
+        if not 0 <= requested <= MAX_LIMIT:
+            raise LimitViolationError(
+                f"feed valve position {requested} is outside 0..{MAX_LIMIT}",
+                unit=unit,
+                value=requested,
+                low=0,
+                high=MAX_LIMIT,
+            )
+        self._registry.set(self.scope(unit), "valve_position", requested)
         return self.status(unit)
 
     def set_setpoint(self, unit: str, value: int, source: str = GOVERNOR) -> Demand:
@@ -159,22 +188,21 @@ class FeedController:
         if source not in {GOVERNOR, PROTECTION}:
             raise ValidationError("unknown setpoint source", source=source)
         requested = int(value)
-        if requested < 0:
+        if not 0 <= requested <= MAX_LIMIT:
             raise LimitViolationError(
-                "a feed setpoint cannot be negative",
+                f"a feed setpoint {requested} is outside 0..{MAX_LIMIT}",
                 unit=unit,
                 value=requested,
                 low=0,
                 high=MAX_LIMIT,
             )
-        current = self.setpoint(unit)
-        chosen = requested
-        chosen_source = source
-        clamped = self._clamp(unit, chosen, chosen_source)
-        self._registry.set(self.scope(unit), "setpoint", clamped)
-        governor_value = clamped if chosen_source == GOVERNOR else current
-        protection_value = clamped if chosen_source == PROTECTION else requested
-        return Demand(unit, clamped, chosen_source, governor_value, protection_value)
+        self._registry.set(self.scope(unit), f"{source}_demand", requested)
+        governor_value = self.governor_demand(unit)
+        protection_value = self.protection_demand(unit)
+        demand = arbitrate(unit, governor_value, protection_value)
+        applied = self._clamp(unit, demand.value)
+        self._registry.set(self.scope(unit), "setpoint", applied)
+        return Demand(unit, applied, demand.source, governor_value, protection_value)
 
     def arbitrate(self, unit: str, governor: int, protection: int) -> Demand:
         """Return the arbitrated demand without applying it."""
@@ -182,13 +210,13 @@ class FeedController:
 
     def lower_limit(self, unit: str, value: int) -> int:
         """Pin the lower clamp, never letting it rise above the upper clamp."""
-        requested = int(value)
-        self._registry.set(self.scope(unit), "low_limit", requested)
-        return requested
+        pinned = min(max(int(value), 0), self.high_limit(unit))
+        self._registry.set(self.scope(unit), "low_limit", pinned)
+        return pinned
 
     def raise_limit(self, unit: str, value: int) -> int:
         """Lift the lower clamp toward a ceiling, never above the upper clamp."""
-        pinned = max(self.low_limit(unit), int(value))
+        pinned = min(max(self.low_limit(unit), int(value)), self.high_limit(unit))
         self._registry.set(self.scope(unit), "low_limit", pinned)
         return pinned
 
@@ -203,7 +231,7 @@ class FeedController:
                 low=0,
                 high=MAX_LIMIT,
             )
-        pinned = requested
+        pinned = max(requested, self.low_limit(unit))
         self._registry.set(self.scope(unit), "high_limit", pinned)
         if self.setpoint(unit) > pinned:
             self._registry.set(self.scope(unit), "setpoint", pinned)
@@ -258,8 +286,6 @@ class FeedController:
         self._stream.commit_upto(record.seq)
         return previous + 1
 
-    def _clamp(self, unit: str, value: int, source: str) -> int:
-        upper = self.high_limit(unit)
-        if source == PROTECTION:
-            return min(max(value, 0), upper)
-        return min(value, upper)
+    def _clamp(self, unit: str, value: int) -> int:
+        """Pin a value inside the band the two clamps define."""
+        return min(max(value, self.low_limit(unit)), self.high_limit(unit))
